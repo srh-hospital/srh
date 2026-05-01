@@ -1,0 +1,205 @@
+from flask import Flask, request, jsonify, session, render_template
+from flask_cors import CORS
+from db import get_db, close_db
+import bcrypt
+
+app = Flask(__name__)
+app.secret_key = "srh_secret_key_change_in_prod"
+CORS(app, supports_credentials=True)
+app.teardown_appcontext(close_db)
+
+# ── SERVE FRONTEND ──────────────────────────────────────
+@app.route("/")
+def index():
+    # Flask automatically finds this inside the 'templates' folder
+    return render_template("index.html")
+
+
+# ── AUTH ────────────────────────────────────────────────
+
+USERS = {
+    "admin": {"password": bcrypt.hashpw(b"admin123", bcrypt.gensalt()), "role": "Admin"},
+    "staff": {"password": bcrypt.hashpw(b"staff123", bcrypt.gensalt()), "role": "Staff"},
+}
+
+def require_auth(fn):
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if "user" not in session:
+            return jsonify({"error": "Unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+def require_admin(fn):
+    from functools import wraps
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if session.get("role") != "Admin":
+            return jsonify({"error": "Admin only"}), 403
+        return fn(*args, **kwargs)
+    return wrapper
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    data = request.get_json()
+    username = data.get("username", "").strip()
+    password = data.get("password", "").strip().encode()
+    user = USERS.get(username)
+    if user and bcrypt.checkpw(password, user["password"]):
+        session["user"] = username
+        session["role"] = user["role"]
+        return jsonify({"username": username.capitalize(), "role": user["role"]})
+    return jsonify({"error": "Invalid credentials"}), 401
+
+@app.route("/api/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return jsonify({"message": "Logged out"})
+
+@app.route("/api/me", methods=["GET"])
+@require_auth
+def me():
+    return jsonify({"user": session["user"], "role": session["role"]})
+
+# ── PATIENTS ────────────────────────────────────────────
+
+@app.route("/api/patients", methods=["GET"])
+@require_auth
+def get_patients():
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM patients ORDER BY id ASC")
+    rows = cursor.fetchall()
+    cursor.close()
+    return jsonify(rows)
+
+@app.route("/api/patients/rfid/<rfid>", methods=["GET"])
+@require_auth
+def get_patient_by_rfid(rfid):
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM patients WHERE rfid = %s", (rfid,))
+    row = cursor.fetchone()
+    cursor.close()
+    if row:
+        return jsonify(row)
+    return jsonify({"error": "Patient not found"}), 404
+
+@app.route("/api/patients", methods=["POST"])
+@require_auth
+def add_patient():
+    data = request.get_json()
+    rfid     = data.get("rfid", "").strip()
+    name     = data.get("name", "").strip()
+    birthdate = data.get("birthdate", "").strip()
+    age      = data.get("age")
+    gender   = data.get("gender", "").strip()
+
+    if not all([rfid, name, birthdate, age, gender]):
+        return jsonify({"error": "All fields are required"}), 400
+
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO patients (rfid, name, birthdate, age, gender) VALUES (%s, %s, %s, %s, %s)",
+            (rfid, name, birthdate, age, gender)
+        )
+        db.commit()
+        new_id = cursor.lastrowid
+        cursor.close()
+        return jsonify({"id": new_id, "message": "Patient saved"}), 201
+    except Exception as e:
+        db.rollback()
+        cursor.close()
+        if "Duplicate" in str(e):
+            return jsonify({"error": "Duplicate RFID — already registered"}), 409
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/patients/<int:pid>", methods=["DELETE"])
+@require_auth
+@require_admin
+def delete_patient(pid):
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute("DELETE FROM medications WHERE patient_id = %s", (pid,))
+        cursor.execute("DELETE FROM patients WHERE id = %s", (pid,))
+        db.commit()
+        cursor.close()
+        return jsonify({"message": "Patient and related medications deleted"})
+    except Exception as e:
+        db.rollback()
+        cursor.close()
+        return jsonify({"error": str(e)}), 500
+
+# ── MEDICATIONS ─────────────────────────────────────────
+
+@app.route("/api/medications", methods=["GET"])
+@require_auth
+def get_medications():
+    pid = request.args.get("patient_id", type=int)
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    if pid:
+        cursor.execute("SELECT * FROM medications WHERE patient_id = %s ORDER BY id ASC", (pid,))
+    else:
+        cursor.execute("SELECT * FROM medications ORDER BY id ASC")
+    rows = cursor.fetchall()
+    cursor.close()
+    return jsonify(rows)
+
+@app.route("/api/medications", methods=["POST"])
+@require_auth
+def add_medication():
+    data = request.get_json()
+    pid      = data.get("patient_id")
+    medicine = data.get("medicine", "").strip()
+    dosage   = data.get("dosage", "").strip()
+    schedule = data.get("schedule", "").strip()
+
+    if not all([pid, medicine, dosage, schedule]):
+        return jsonify({"error": "All fields are required"}), 400
+
+    db = get_db()
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT id FROM patients WHERE id = %s", (pid,))
+    if not cursor.fetchone():
+        cursor.close()
+        return jsonify({"error": "Patient ID not found"}), 404
+
+    cursor.close()
+    cursor = db.cursor()
+    try:
+        cursor.execute(
+            "INSERT INTO medications (patient_id, medicine, dosage, schedule) VALUES (%s, %s, %s, %s)",
+            (pid, medicine, dosage, schedule)
+        )
+        db.commit()
+        new_id = cursor.lastrowid
+        cursor.close()
+        return jsonify({"id": new_id, "message": "Medication saved"}), 201
+    except Exception as e:
+        db.rollback()
+        cursor.close()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/medications/<int:mid>", methods=["DELETE"])
+@require_auth
+@require_admin
+def delete_medication(mid):
+    db = get_db()
+    cursor = db.cursor()
+    try:
+        cursor.execute("DELETE FROM medications WHERE id = %s", (mid,))
+        db.commit()
+        cursor.close()
+        return jsonify({"message": "Medication deleted"})
+    except Exception as e:
+        db.rollback()
+        cursor.close()
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
